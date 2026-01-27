@@ -58,12 +58,15 @@ class OCRResponse(BaseModel):
     success: bool
     text: str
     amount: float
+    currency: str  # ISO currency code (USD, EUR, GBP, NGN, etc.) or UNKNOWN
+    amount_usd: float  # Converted to USD for JRA calculation
     bill_type: str
     transaction_id: str | None
     date: str | None
     time: str | None
     utility_score: int
     confidence: float
+    supported_currencies: list[str] = []  # List of detected currencies
 
 
 def preprocess_image(img_bytes: bytes) -> np.ndarray:
@@ -125,26 +128,234 @@ def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
     return full_text, avg_conf
 
 
-def extract_amount(text: str) -> float:
-    """Extract monetary amount"""
-    patterns = [
-        r'(?:₦|NGN|N)\s*([\d,]+(?:\.\d{2})?)',
-        r'(?:amount|total|paid|successful|credited)\s*[:\s]*(?:₦|NGN|N)?\s*([\d,]+(?:\.\d{2})?)',
-        r'([\d,]+(?:\.\d{2})?)\s*(?:naira|NGN)',
-    ]
+# Comprehensive global currency support
+# Symbol to currency code mapping
+CURRENCY_SYMBOLS = {
+    # Major currencies
+    '$': 'USD', '€': 'EUR', '£': 'GBP', '₦': 'NGN', '¥': 'JPY', '₹': 'INR',
+    '₽': 'RUB', '₩': 'KRW', '฿': 'THB', '₱': 'PHP', '₫': 'VND', '₴': 'UAH',
+    '₺': 'TRY', '₼': 'AZN', '₾': 'GEL', '₸': 'KZT', '₿': 'BTC',
+    # Multi-char symbols
+    'R$': 'BRL', 'RM': 'MYR', 'Rp': 'IDR', 'Rs': 'INR', 'Rs.': 'INR',
+    'kr': 'SEK', 'Kr': 'SEK', 'Kč': 'CZK', 'zł': 'PLN', 'Ft': 'HUF',
+    'lei': 'RON', 'лв': 'BGN', 'din': 'RSD', 'kn': 'HRK',
+    # Asian
+    '元': 'CNY', '円': 'JPY', '원': 'KRW', '₮': 'MNT',
+    # African
+    'R': 'ZAR', 'KSh': 'KES', 'GH₵': 'GHS', '₵': 'GHS', 'TSh': 'TZS',
+    'USh': 'UGX', 'CFA': 'XOF', 'FCFA': 'XAF', 'DH': 'MAD', 'DA': 'DZD',
+    'E£': 'EGP', 'LE': 'EGP',
+    # Middle East
+    'ر.س': 'SAR', 'د.إ': 'AED', 'ر.ق': 'QAR', 'د.ك': 'KWD', 'د.ب': 'BHD',
+    'ر.ع': 'OMR', 'د.أ': 'JOD', '₪': 'ILS',
+    # Americas
+    'C$': 'CAD', 'A$': 'AUD', 'NZ$': 'NZD', 'MX$': 'MXN', 'AR$': 'ARS',
+    'CL$': 'CLP', 'CO$': 'COP', 'S/.': 'PEN',
+}
 
-    amounts = []
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
+# All supported currency codes
+CURRENCY_CODES = [
+    # Major
+    'USD', 'EUR', 'GBP', 'NGN', 'JPY', 'CNY', 'INR', 'CAD', 'AUD', 'CHF',
+    # Asia Pacific
+    'KRW', 'SGD', 'HKD', 'TWD', 'THB', 'MYR', 'IDR', 'PHP', 'VND', 'PKR',
+    'BDT', 'LKR', 'NPR', 'MMK', 'KHR', 'LAK', 'BND', 'MNT',
+    # Europe
+    'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF', 'RON', 'BGN', 'HRK', 'RSD',
+    'UAH', 'RUB', 'BYN', 'MDL', 'ALL', 'MKD', 'BAM', 'ISK', 'TRY', 'GEL',
+    'AZN', 'AMD', 'KZT', 'UZS', 'KGS', 'TJS', 'TMT',
+    # Americas
+    'MXN', 'BRL', 'ARS', 'CLP', 'COP', 'PEN', 'VES', 'UYU', 'PYG', 'BOB',
+    'GTQ', 'HNL', 'NIO', 'CRC', 'PAB', 'DOP', 'CUP', 'JMD', 'TTD', 'BBD',
+    'BSD', 'BZD', 'GYD', 'SRD', 'HTG', 'AWG', 'ANG', 'XCD',
+    # Middle East
+    'SAR', 'AED', 'QAR', 'KWD', 'BHD', 'OMR', 'JOD', 'LBP', 'SYP', 'IQD',
+    'IRR', 'YER', 'ILS', 'EGP', 'AFN',
+    # Africa
+    'ZAR', 'KES', 'GHS', 'TZS', 'UGX', 'RWF', 'BIF', 'ETB', 'SOS', 'DJF',
+    'ERN', 'SDG', 'SSP', 'XOF', 'XAF', 'MAD', 'DZD', 'TND', 'LYD', 'MUR',
+    'SCR', 'MGA', 'MWK', 'ZMW', 'BWP', 'NAD', 'SZL', 'LSL', 'AOA', 'CDF',
+    'GMD', 'GNF', 'LRD', 'SLL', 'CVE', 'STN', 'MZN', 'ZWL',
+    # Oceania
+    'NZD', 'FJD', 'PGK', 'SBD', 'VUV', 'WST', 'TOP', 'XPF',
+    # Crypto
+    'BTC', 'ETH', 'USDT', 'USDC',
+]
+
+# Exchange rates to USD (approximate, for offline calculation)
+# Values: 1 unit of currency = X USD
+EXCHANGE_RATES_TO_USD = {
+    # Major currencies
+    'USD': 1.0, 'EUR': 1.08, 'GBP': 1.27, 'CHF': 1.12, 'JPY': 0.0067,
+    'CNY': 0.14, 'INR': 0.012, 'CAD': 0.74, 'AUD': 0.65, 'NZD': 0.61,
+    # Nigerian Naira
+    'NGN': 0.000625,  # 1 NGN = 0.000625 USD (1600 NGN per USD)
+    # Asian
+    'KRW': 0.00075, 'SGD': 0.74, 'HKD': 0.13, 'TWD': 0.031, 'THB': 0.028,
+    'MYR': 0.22, 'IDR': 0.000063, 'PHP': 0.018, 'VND': 0.00004, 'PKR': 0.0036,
+    'BDT': 0.0091, 'LKR': 0.003, 'NPR': 0.0075,
+    # European
+    'SEK': 0.095, 'NOK': 0.092, 'DKK': 0.14, 'PLN': 0.25, 'CZK': 0.043,
+    'HUF': 0.0027, 'RON': 0.22, 'BGN': 0.55, 'HRK': 0.14, 'UAH': 0.027,
+    'RUB': 0.011, 'TRY': 0.031, 'ISK': 0.0072,
+    # Middle East
+    'SAR': 0.27, 'AED': 0.27, 'QAR': 0.27, 'KWD': 3.25, 'BHD': 2.65,
+    'OMR': 2.60, 'JOD': 1.41, 'ILS': 0.27, 'EGP': 0.032, 'LBP': 0.000011,
+    # African
+    'ZAR': 0.055, 'KES': 0.0078, 'GHS': 0.083, 'TZS': 0.00039, 'UGX': 0.00027,
+    'XOF': 0.0016, 'XAF': 0.0016, 'MAD': 0.10, 'DZD': 0.0074, 'TND': 0.32,
+    # Americas
+    'MXN': 0.058, 'BRL': 0.20, 'ARS': 0.0012, 'CLP': 0.0011, 'COP': 0.00025,
+    'PEN': 0.27,
+    # Default for unknown
+    'DEFAULT': 1.0,
+}
+
+# Build regex patterns for all currencies
+def build_currency_patterns():
+    """Build comprehensive currency detection patterns"""
+    patterns = {}
+
+    # Symbol-based patterns (high priority)
+    for symbol, code in CURRENCY_SYMBOLS.items():
+        if code not in patterns:
+            patterns[code] = []
+        # Escape special regex chars in symbol
+        escaped = re.escape(symbol)
+        patterns[code].append(rf'{escaped}\s*([\d,]+(?:\.\d{{1,2}})?)')
+        patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*{escaped}')
+
+    # Code-based patterns
+    for code in CURRENCY_CODES:
+        if code not in patterns:
+            patterns[code] = []
+        patterns[code].append(rf'(?:{code})\s*([\d,]+(?:\.\d{{1,2}})?)')
+        patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*(?:{code})')
+
+    # Add generic amount patterns for NGN (common Nigerian format)
+    if 'NGN' in patterns:
+        patterns['NGN'].extend([
+            r'(?:amount|total|paid|successful|credited)\s*[:\s]*(?:₦|NGN|N)?\s*([\d,]+(?:\.\d{1,2})?)',
+            r'(?:naira)\s*([\d,]+(?:\.\d{1,2})?)',
+            r'([\d,]+(?:\.\d{1,2})?)\s*(?:naira)',
+        ])
+
+    return patterns
+
+CURRENCY_PATTERNS = build_currency_patterns()
+
+
+def get_amount_range(currency: str) -> tuple[float, float]:
+    """Get valid amount range for a currency based on its typical values"""
+    # High-value currencies (1 unit > $1 USD)
+    high_value = ['KWD', 'BHD', 'OMR', 'JOD', 'GBP', 'EUR', 'CHF', 'USD', 'CAD', 'AUD', 'SGD', 'BTC', 'ETH']
+    # Medium-value currencies
+    medium_value = ['SAR', 'AED', 'QAR', 'MYR', 'BRL', 'PLN', 'ILS', 'NZD', 'HKD', 'CNY']
+    # Low-value currencies (need larger amounts)
+    low_value = ['NGN', 'KRW', 'JPY', 'IDR', 'VND', 'IRR', 'LBP', 'VES', 'ZWL']
+
+    if currency in high_value:
+        return (0.01, 1000000)  # $0.01 to $1M
+    elif currency in medium_value:
+        return (0.1, 10000000)  # Slightly higher minimum
+    elif currency in low_value:
+        return (1, 100000000000)  # Large amounts common
+    else:
+        return (0.01, 100000000)  # Default range
+
+
+def extract_amount_with_currency(text: str) -> tuple[float, str]:
+    """Extract monetary amount and detect currency from any global currency"""
+    results = {}  # currency -> list of (amount, confidence_score)
+
+    for currency, patterns in CURRENCY_PATTERNS.items():
+        min_amt, max_amt = get_amount_range(currency)
+        amounts = []
+
+        for i, pattern in enumerate(patterns):
+            try:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                for match in matches:
+                    try:
+                        # Handle both comma and period as thousand separators
+                        cleaned = match.replace(',', '').replace(' ', '')
+                        amount = float(cleaned)
+                        if min_amt <= amount <= max_amt:
+                            # Higher score for symbol-based matches (first patterns)
+                            confidence = 10 - min(i, 5)
+                            amounts.append((amount, confidence))
+                    except ValueError:
+                        continue
+            except re.error:
+                continue
+
+        if amounts:
+            # Sort by confidence and take highest amount among top confidence
+            amounts.sort(key=lambda x: (-x[1], -x[0]))
+            results[currency] = amounts
+
+    if not results:
+        # Try to find any number that looks like a bill amount
+        generic_pattern = r'(?:total|amount|paid|sum|balance)[:\s]*([\\d,]+(?:\\.\\d{1,2})?)'
+        matches = re.findall(generic_pattern, text, re.IGNORECASE)
         for match in matches:
             try:
                 amount = float(match.replace(',', ''))
-                if 10 <= amount <= 10000000:
-                    amounts.append(amount)
+                if 1 <= amount <= 100000000:
+                    return amount, 'UNKNOWN'
             except ValueError:
                 continue
+        return 0, 'UNKNOWN'
 
-    return max(amounts) if amounts else 0
+    # Priority order for currency detection
+    priority_order = [
+        # Specific symbols first (high confidence)
+        'USD', 'EUR', 'GBP', 'JPY', 'CNY', 'INR', 'CHF', 'CAD', 'AUD',
+        # Regional currencies
+        'NGN', 'KES', 'GHS', 'ZAR', 'EGP',  # Africa
+        'SAR', 'AED', 'QAR', 'KWD', 'ILS',  # Middle East
+        'BRL', 'MXN', 'ARS', 'COP', 'CLP',  # Americas
+        'KRW', 'SGD', 'HKD', 'THB', 'MYR', 'IDR', 'PHP', 'VND',  # Asia
+        'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'TRY', 'RUB',  # Europe
+    ]
+
+    # Find the best match
+    best_currency = None
+    best_amount = 0
+    best_confidence = 0
+
+    for currency in priority_order:
+        if currency in results:
+            top_match = results[currency][0]
+            if top_match[1] > best_confidence or (top_match[1] == best_confidence and top_match[0] > best_amount):
+                best_currency = currency
+                best_amount = top_match[0]
+                best_confidence = top_match[1]
+
+    # If none from priority, use first found
+    if not best_currency and results:
+        best_currency = list(results.keys())[0]
+        best_amount = results[best_currency][0][0]
+
+    return best_amount, best_currency or 'UNKNOWN'
+
+
+def convert_to_usd(amount: float, currency: str) -> float:
+    """Convert amount to USD using exchange rates"""
+    if amount <= 0:
+        return 0
+
+    if currency == 'USD':
+        return amount
+
+    rate = EXCHANGE_RATES_TO_USD.get(currency, EXCHANGE_RATES_TO_USD.get('DEFAULT', 1.0))
+    return amount * rate
+
+
+def extract_amount(text: str) -> float:
+    """Extract monetary amount (legacy function for compatibility)"""
+    amount, _ = extract_amount_with_currency(text)
+    return amount
 
 
 def extract_transaction_id(text: str) -> str | None:
@@ -261,16 +472,20 @@ async def process_image(request: OCRRequest):
                 success=False,
                 text="",
                 amount=0,
+                currency="UNKNOWN",
+                amount_usd=0,
                 bill_type="unknown",
                 transaction_id=None,
                 date=None,
                 time=None,
                 utility_score=0,
-                confidence=0
+                confidence=0,
+                supported_currencies=CURRENCY_CODES[:20]  # Return top 20 for reference
             )
 
         # Extract fields
-        amount = extract_amount(text)
+        amount, currency = extract_amount_with_currency(text)
+        amount_usd = convert_to_usd(amount, currency)
         transaction_id = extract_transaction_id(text)
         date, time = extract_date_time(text)
         bill_type = detect_bill_type(text)
@@ -280,12 +495,15 @@ async def process_image(request: OCRRequest):
             success=True,
             text=text,
             amount=amount,
+            currency=currency,
+            amount_usd=round(amount_usd, 4),
             bill_type=bill_type,
             transaction_id=transaction_id,
             date=date,
             time=time,
             utility_score=utility_score,
-            confidence=confidence
+            confidence=confidence,
+            supported_currencies=CURRENCY_CODES[:20]
         )
 
     except HTTPException:
