@@ -120,7 +120,7 @@ def preprocess_image(img_bytes: bytes) -> np.ndarray:
 def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
     """Extract text using PaddleOCR"""
     ocr_instance = get_ocr()
-    result = ocr_instance.ocr(img_cv, cls=True)
+    result = ocr_instance.ocr(img_cv)
 
     if not result or not result[0]:
         return "", 0.0
