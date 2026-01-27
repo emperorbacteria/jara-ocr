@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lazy initialization of PaddleOCR
+# PaddleOCR initialization (models pre-downloaded in Docker build)
 ocr = None
 ocr_lock = threading.Lock()
 ocr_ready = False
@@ -37,6 +37,16 @@ def get_ocr():
                 ocr_ready = True
                 print("PaddleOCR ready!")
     return ocr
+
+def init_ocr_on_startup():
+    """Initialize OCR on app startup in a background thread"""
+    import time
+    time.sleep(2)  # Wait for app to fully start
+    try:
+        get_ocr()
+        print("OCR pre-initialized successfully")
+    except Exception as e:
+        print(f"OCR initialization error: {e}")
 
 # Utility keywords for bill detection
 UTILITY_KEYWORDS = {
@@ -510,6 +520,13 @@ async def process_image(request: OCRRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize OCR in background on startup"""
+    thread = threading.Thread(target=init_ocr_on_startup, daemon=True)
+    thread.start()
 
 
 if __name__ == "__main__":
