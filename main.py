@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from paddleocr import PaddleOCR
 import cv2
 import numpy as np
 from PIL import Image
@@ -9,6 +8,7 @@ import base64
 import io
 import re
 import os
+import threading
 
 app = FastAPI(title="Jara OCR Service", version="1.0.0")
 
@@ -21,10 +21,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize PaddleOCR once at startup
-print("Initializing PaddleOCR...")
-ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-print("PaddleOCR ready!")
+# Lazy initialization of PaddleOCR
+ocr = None
+ocr_lock = threading.Lock()
+ocr_ready = False
+
+def get_ocr():
+    global ocr, ocr_ready
+    if ocr is None:
+        with ocr_lock:
+            if ocr is None:
+                print("Initializing PaddleOCR...")
+                from paddleocr import PaddleOCR
+                ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+                ocr_ready = True
+                print("PaddleOCR ready!")
+    return ocr
 
 # Utility keywords for bill detection
 UTILITY_KEYWORDS = {
@@ -90,7 +102,8 @@ def preprocess_image(img_bytes: bytes) -> np.ndarray:
 
 def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
     """Extract text using PaddleOCR"""
-    result = ocr.ocr(img_cv, cls=True)
+    ocr_instance = get_ocr()
+    result = ocr_instance.ocr(img_cv, cls=True)
 
     if not result or not result[0]:
         return "", 0.0
@@ -209,8 +222,16 @@ def health_check():
         "status": "ok",
         "service": "Jara OCR Service",
         "version": "1.0.0",
-        "ocr_engine": "PaddleOCR"
+        "ocr_engine": "PaddleOCR",
+        "ocr_ready": ocr_ready
     }
+
+
+@app.get("/warmup")
+def warmup():
+    """Trigger OCR initialization"""
+    get_ocr()
+    return {"status": "ok", "ocr_ready": True}
 
 
 @app.post("/ocr", response_model=OCRResponse)
