@@ -33,7 +33,11 @@ def get_ocr():
             if ocr is None:
                 print("Initializing PaddleOCR...")
                 from paddleocr import PaddleOCR
-                ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+                # Use optimized settings for lower memory usage
+                ocr = PaddleOCR(
+                    use_angle_cls=False,  # Skip angle classification to save memory
+                    lang='en'
+                )
                 ocr_ready = True
                 print("PaddleOCR ready!")
     return ocr
