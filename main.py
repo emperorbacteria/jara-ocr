@@ -440,14 +440,23 @@ def build_currency_patterns():
     """Build comprehensive currency detection patterns"""
     patterns = {}
 
+    # Ambiguous symbols that need word boundaries to avoid false positives
+    AMBIGUOUS_SYMBOLS = {'DA', 'R', 'E', 'K', 'S'}
+
     # Symbol-based patterns (high priority)
     for symbol, code in CURRENCY_SYMBOLS.items():
         if code not in patterns:
             patterns[code] = []
         # Escape special regex chars in symbol
         escaped = re.escape(symbol)
-        patterns[code].append(rf'{escaped}\s*([\d,]+(?:\.\d{{1,2}})?)')
-        patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*{escaped}')
+
+        # Use word boundaries for short/ambiguous symbols
+        if symbol in AMBIGUOUS_SYMBOLS:
+            patterns[code].append(rf'\b{escaped}\s*([\d,]+(?:\.\d{{1,2}})?)')
+            patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*{escaped}\b')
+        else:
+            patterns[code].append(rf'{escaped}\s*([\d,]+(?:\.\d{{1,2}})?)')
+            patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*{escaped}')
 
     # Code-based patterns
     for code in CURRENCY_CODES:
@@ -520,7 +529,7 @@ def extract_amount_with_currency(text: str) -> tuple[float, str]:
 
     if not results:
         # Try to find any number that looks like a bill amount
-        generic_pattern = r'(?:total|amount|paid|sum|balance)[:\s]*([\\d,]+(?:\\.\\d{1,2})?)'
+        generic_pattern = r'(?:total|amount|paid|sum|balance|successful)[:\s]*([\d,]+(?:\.\d{1,2})?)'
         matches = re.findall(generic_pattern, text, re.IGNORECASE)
         for match in matches:
             try:
