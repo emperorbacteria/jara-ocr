@@ -78,12 +78,18 @@ class OCRResponse(BaseModel):
     currency: str  # ISO currency code (USD, EUR, GBP, NGN, etc.) or UNKNOWN
     amount_usd: float  # Converted to USD for JRA calculation
     bill_type: str
+    bill_category: str  # 'utility', 'transfer', 'deposit', 'unknown'
     transaction_id: str | None
     date: str | None
     time: str | None
     utility_score: int
     confidence: float
     supported_currencies: list[str] = []  # List of detected currencies
+    # Validation fields
+    is_valid_bill: bool = False  # Whether this is a valid utility bill
+    rejection_reason: str | None = None  # Reason if rejected
+    receipt_date_iso: str | None = None  # Parsed date in ISO format
+    provider: str | None = None  # Detected provider (OPay, PalmPay, etc.)
 
 
 def preprocess_image(img_bytes: bytes) -> np.ndarray:
@@ -426,24 +432,195 @@ def extract_date_time(text: str) -> tuple[str | None, str | None]:
     return date, time
 
 
-def detect_bill_type(text: str) -> str:
-    """Detect type of bill"""
+def detect_bill_type(text: str) -> tuple[str, str]:
+    """Detect type of bill and category
+    Returns: (bill_type, bill_category)
+    Categories: 'utility', 'transfer', 'deposit', 'unknown'
+    """
     text_lower = text.lower()
 
-    if any(kw in text_lower for kw in ['airtime', 'recharge', 'top up', 'topup']):
-        return 'airtime'
-    elif any(kw in text_lower for kw in ['data', 'mb', 'gb', 'bundle']):
-        return 'data'
-    elif any(kw in text_lower for kw in ['electricity', 'kwh', 'meter', 'prepaid', 'phcn', 'eko', 'ikeja']):
-        return 'electricity'
-    elif any(kw in text_lower for kw in ['water', 'fctwb']):
-        return 'water'
-    elif any(kw in text_lower for kw in ['internet', 'wifi', 'broadband']):
-        return 'internet'
-    elif any(kw in text_lower for kw in ['gas', 'cooking']):
-        return 'gas'
-    else:
-        return 'utility'
+    # Check for UTILITY BILLS first (these are VALID)
+    if any(kw in text_lower for kw in ['airtime', 'recharge', 'top up', 'topup', 'top-up']):
+        return 'airtime', 'utility'
+    elif any(kw in text_lower for kw in ['data', 'bundle']) and any(kw in text_lower for kw in ['gb', 'mb', 'plan', 'glo', 'mtn', 'airtel', '9mobile']):
+        return 'data', 'utility'
+    elif any(kw in text_lower for kw in ['electricity', 'kwh', 'meter', 'phcn', 'eko', 'ikeja', 'ibedc', 'aedc', 'disco', 'prepaid meter', 'postpaid']):
+        return 'electricity', 'utility'
+    elif any(kw in text_lower for kw in ['water', 'fctwb', 'water board', 'water bill']):
+        return 'water', 'utility'
+    elif any(kw in text_lower for kw in ['internet', 'wifi', 'broadband', 'fiber', 'spectranet', 'smile']):
+        return 'internet', 'utility'
+    elif any(kw in text_lower for kw in ['gas', 'cooking gas', 'lpg']):
+        return 'gas', 'utility'
+    elif any(kw in text_lower for kw in ['cable', 'tv', 'dstv', 'gotv', 'startimes', 'showmax']):
+        return 'cable', 'utility'
+    elif any(kw in text_lower for kw in ['betting', 'bet9ja', 'sportybet', 'betway', 'nairabet', '1xbet']):
+        return 'betting', 'utility'
+
+    # Check for TRANSFERS (NOT VALID utility bills)
+    transfer_keywords = [
+        'transfer', 'bank transfer', 'inter-bank', 'interbank', 'nip transfer',
+        'beneficiary', 'sender', 'recipient account', 'destination bank',
+        'from:', 'to:', 'narration', 'other local banks'
+    ]
+    if any(kw in text_lower for kw in transfer_keywords):
+        # But check if it's actually a utility payment via transfer
+        if any(kw in text_lower for kw in ['vbank|glo', 'vbank|mtn', 'vbank|airtel', 'chamswitch|', 'airtime|', 'data|']):
+            # This is a utility bill paid via bank
+            if 'data|' in text_lower or 'data bundle' in text_lower:
+                return 'data', 'utility'
+            else:
+                return 'airtime', 'utility'
+        return 'transfer', 'transfer'
+
+    # Check for DEPOSITS (NOT VALID)
+    deposit_keywords = ['deposit', 'bank deposit', 'credited to', 'credit alert', 'inward transfer']
+    if any(kw in text_lower for kw in deposit_keywords):
+        return 'deposit', 'deposit'
+
+    # Unknown - needs manual review
+    return 'unknown', 'unknown'
+
+
+def detect_provider(text: str) -> str | None:
+    """Detect the payment provider from the receipt"""
+    text_lower = text.lower()
+
+    providers = {
+        'opay': ['opay', 'o-pay'],
+        'palmpay': ['palmpay', 'palm pay'],
+        'moniepoint': ['moniepoint', 'monie point'],
+        'kuda': ['kuda'],
+        'firstbank': ['firstbank', 'first bank', 'firstmobile'],
+        'gtbank': ['gtbank', 'gt bank', 'guaranty'],
+        'accessbank': ['access bank', 'accessbank', 'accessmore'],
+        'zenithbank': ['zenith bank', 'zenithbank'],
+        'ubabank': ['uba', 'united bank for africa'],
+        'vbank': ['vbank', 'vfd', 'v bank'],
+        'ecobank': ['ecobank', 'eco bank'],
+        'polaris': ['polaris', 'polaris bank'],
+        'wema': ['wema', 'alat'],
+        'fcmb': ['fcmb', 'first city'],
+        'fidelity': ['fidelity'],
+        'stanbic': ['stanbic', 'stanbic ibtc'],
+        'sterling': ['sterling'],
+        'union': ['union bank'],
+        'vulte': ['vulte', 'vul-te'],
+        'carbon': ['carbon', 'paylater'],
+        'fairmoney': ['fairmoney', 'fair money'],
+        'glo': ['glo', 'globacom'],
+        'mtn': ['mtn'],
+        'airtel': ['airtel'],
+        '9mobile': ['9mobile', 'etisalat'],
+    }
+
+    for provider, keywords in providers.items():
+        if any(kw in text_lower for kw in keywords):
+            return provider
+
+    return None
+
+
+def parse_receipt_date(date_str: str | None, time_str: str | None = None) -> str | None:
+    """Parse receipt date string into ISO format"""
+    if not date_str:
+        return None
+
+    from datetime import datetime
+    import calendar
+
+    # Clean up the date string
+    date_str = date_str.strip()
+
+    # Common date formats to try
+    formats = [
+        '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d',
+        '%d-%m-%Y', '%m-%d-%Y', '%Y-%m-%d',
+        '%d %B %Y', '%d %b %Y', '%B %d, %Y', '%b %d, %Y',
+        '%d %B, %Y', '%d %b, %Y',
+        '%Y-%m-%d %H:%M:%S',
+        '%d/%m/%y', '%m/%d/%y',
+    ]
+
+    # Handle formats like "Mar 17th, 2025" or "March 17, 2025"
+    # Remove ordinal suffixes
+    import re
+    date_str_clean = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str)
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str_clean, fmt)
+            # Add time if available
+            if time_str:
+                try:
+                    time_str_clean = time_str.strip().upper()
+                    for tfmt in ['%H:%M:%S', '%H:%M', '%I:%M:%S %p', '%I:%M %p', '%I:%M:%S%p', '%I:%M%p']:
+                        try:
+                            time_part = datetime.strptime(time_str_clean, tfmt)
+                            dt = dt.replace(hour=time_part.hour, minute=time_part.minute, second=time_part.second)
+                            break
+                        except ValueError:
+                            continue
+                except:
+                    pass
+            return dt.isoformat()
+        except ValueError:
+            continue
+
+    return None
+
+
+def validate_bill(bill_type: str, bill_category: str, amount: float,
+                  receipt_date_iso: str | None, utility_score: int) -> tuple[bool, str | None]:
+    """
+    Validate if a bill should be approved or rejected.
+    Returns: (is_valid, rejection_reason)
+    """
+    from datetime import datetime, timedelta
+
+    # Rule 1: Must be a utility bill category
+    if bill_category not in ['utility']:
+        if bill_category == 'transfer':
+            return False, "Bank transfers are not eligible. Only utility bill payments (airtime, data, electricity, etc.) are accepted."
+        elif bill_category == 'deposit':
+            return False, "Bank deposits are not eligible. Only utility bill payments are accepted."
+        else:
+            return False, "Unable to identify bill type. Please upload a clear utility bill receipt."
+
+    # Rule 2: Must have a valid amount
+    if amount <= 0:
+        return False, "Could not detect bill amount. Please ensure the amount is clearly visible."
+
+    # Rule 3: Minimum amount threshold (e.g., 50 NGN minimum)
+    MIN_AMOUNT_NGN = 50
+    if amount < MIN_AMOUNT_NGN:
+        return False, f"Bill amount (₦{amount:.2f}) is below minimum threshold of ₦{MIN_AMOUNT_NGN}."
+
+    # Rule 4: Check receipt age (must be within 24 hours)
+    if receipt_date_iso:
+        try:
+            receipt_dt = datetime.fromisoformat(receipt_date_iso)
+            now = datetime.now()
+            age = now - receipt_dt
+
+            # Allow up to 24 hours
+            if age > timedelta(hours=24):
+                hours_old = age.total_seconds() / 3600
+                return False, f"Receipt is {hours_old:.0f} hours old. Only receipts from the last 24 hours are accepted."
+
+            # Check if receipt is from the future (suspicious)
+            if receipt_dt > now + timedelta(hours=1):  # Allow 1 hour tolerance
+                return False, "Receipt date appears to be in the future. Please upload a valid receipt."
+        except:
+            pass  # If we can't parse the date, we'll allow it for manual review
+
+    # Rule 5: Utility score threshold
+    MIN_UTILITY_SCORE = 4
+    if utility_score < MIN_UTILITY_SCORE:
+        return False, f"Receipt does not appear to be a valid utility bill (score: {utility_score}/{MIN_UTILITY_SCORE} required)."
+
+    # All checks passed
+    return True, None
 
 
 def calculate_utility_score(text: str) -> int:
@@ -515,12 +692,17 @@ async def process_image(request: OCRRequest):
                 currency="UNKNOWN",
                 amount_usd=0,
                 bill_type="unknown",
+                bill_category="unknown",
                 transaction_id=None,
                 date=None,
                 time=None,
                 utility_score=0,
                 confidence=0,
-                supported_currencies=CURRENCY_CODES[:20]  # Return top 20 for reference
+                supported_currencies=CURRENCY_CODES[:20],
+                is_valid_bill=False,
+                rejection_reason="No text could be extracted from the image.",
+                receipt_date_iso=None,
+                provider=None
             )
 
         # Extract fields
@@ -528,10 +710,18 @@ async def process_image(request: OCRRequest):
         amount_usd = convert_to_usd(amount, currency)
         transaction_id = extract_transaction_id(text)
         date, time = extract_date_time(text)
-        bill_type = detect_bill_type(text)
+        bill_type, bill_category = detect_bill_type(text)
         utility_score = calculate_utility_score(text)
+        provider = detect_provider(text)
+        receipt_date_iso = parse_receipt_date(date, time)
 
-        print(f"Extracted: amount={amount} {currency}, type={bill_type}, txn={transaction_id}")
+        # Validate the bill
+        is_valid_bill, rejection_reason = validate_bill(
+            bill_type, bill_category, amount, receipt_date_iso, utility_score
+        )
+
+        print(f"Extracted: amount={amount} {currency}, type={bill_type}, category={bill_category}, provider={provider}")
+        print(f"Validation: valid={is_valid_bill}, reason={rejection_reason}")
 
         return OCRResponse(
             success=True,
@@ -540,12 +730,17 @@ async def process_image(request: OCRRequest):
             currency=currency,
             amount_usd=round(amount_usd, 4),
             bill_type=bill_type,
+            bill_category=bill_category,
             transaction_id=transaction_id,
             date=date,
             time=time,
             utility_score=utility_score,
             confidence=confidence,
-            supported_currencies=CURRENCY_CODES[:20]
+            supported_currencies=CURRENCY_CODES[:20],
+            is_valid_bill=is_valid_bill,
+            rejection_reason=rejection_reason,
+            receipt_date_iso=receipt_date_iso,
+            provider=provider
         )
 
     except HTTPException:
