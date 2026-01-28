@@ -882,6 +882,33 @@ def detect_bill_type(text: str) -> tuple[str, str]:
     if any(kw in text_lower for kw in deposit_keywords):
         return 'deposit', 'deposit'
 
+    # Check if this looks like a valid payment receipt even if we can't identify type
+    # Signs of a valid receipt: has amount, provider name, transaction markers
+    receipt_markers = [
+        'successful', 'completed', 'confirmed', 'approved', 'paid', 'received',
+        'transaction', 'receipt', 'reference', 'ref', 'txn', 'order',
+        'amount', 'total', 'balance', 'fee', 'charge',
+        'thank you', 'thanks',
+    ]
+
+    # Check for receipt markers
+    has_receipt_markers = sum(1 for marker in receipt_markers if marker in text_lower)
+
+    # Check for payment provider presence
+    payment_providers = [
+        'opay', 'palmpay', 'moniepoint', 'kuda', 'firstbank', 'gtbank',
+        'access', 'zenith', 'uba', 'vbank', 'ecobank', 'mpesa', 'paypal',
+        'venmo', 'cashapp', 'wise', 'revolut', 'stripe', 'paystack',
+    ]
+    has_provider = any(p in text_lower for p in payment_providers)
+
+    # Check for amount pattern
+    has_amount = bool(re.search(r'\d{2,}[.,]\d{2}|\d{3,}', text))
+
+    # If it looks like a payment receipt, classify as "payment" needing manual review
+    if (has_receipt_markers >= 2) or (has_provider and has_amount):
+        return 'payment', 'utility'  # Treat as utility payment, needs manual review for exact type
+
     # Unknown - needs manual review
     return 'unknown', 'unknown'
 
@@ -1075,9 +1102,14 @@ def validate_bill(bill_type: str, bill_category: str, amount: float,
     # Rule 5: Utility score threshold
     # If we confidently identified a specific utility type, lower the threshold
     KNOWN_UTILITY_TYPES = ['airtime', 'data', 'electricity', 'water', 'gas', 'internet', 'cable', 'betting']
+
     if bill_type in KNOWN_UTILITY_TYPES:
         # We identified a specific utility type, be more lenient
         MIN_UTILITY_SCORE = 2
+    elif bill_type == 'payment':
+        # Generic payment detected (has provider + amount but couldn't identify exact type)
+        # Be lenient since it looks like a valid payment receipt
+        MIN_UTILITY_SCORE = 1
     else:
         # Unknown type, require higher confidence
         MIN_UTILITY_SCORE = 4
