@@ -567,16 +567,38 @@ def extract_amount_with_currency(text: str) -> tuple[float, str]:
             results[currency] = amounts
 
     if not results:
-        # Try to find any number that looks like a bill amount
+        # First, try to find amount with keyword context
         generic_pattern = r'(?:total|amount|paid|sum|balance|successful)[:\s]*([\d,]+(?:\.\d{1,2})?)'
         matches = re.findall(generic_pattern, text, re.IGNORECASE)
         for match in matches:
             try:
                 amount = float(match.replace(',', ''))
                 if 1 <= amount <= 100000000:
-                    return amount, 'UNKNOWN'
+                    # Use region currency if detected, otherwise UNKNOWN
+                    return amount, region_currency or 'UNKNOWN'
             except ValueError:
                 continue
+
+        # If we have a region, try finding any reasonable amount
+        if region_currency:
+            amount_pattern = r'([\d,]+\.\d{2}|\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d{4,}(?:\.\d{2})?)'
+            matches = re.findall(amount_pattern, text)
+            valid_amounts = []
+            for match in matches:
+                try:
+                    amount = float(match.replace(',', ''))
+                    if region_currency == 'NGN' and 50 <= amount <= 10000000:
+                        valid_amounts.append(amount)
+                    elif 1 <= amount <= 100000000:
+                        valid_amounts.append(amount)
+                except ValueError:
+                    continue
+
+            if valid_amounts:
+                best_amount = max(valid_amounts)
+                print(f"No currency patterns matched, using region fallback: {best_amount} {region_currency}")
+                return best_amount, region_currency
+
         return 0, 'UNKNOWN'
 
     # Priority order for currency detection
