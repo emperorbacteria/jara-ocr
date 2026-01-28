@@ -38,12 +38,12 @@ def get_ocr():
                 ocr = PaddleOCR(
                     use_angle_cls=True,  # Enable angle classification for rotated text
                     lang='en',  # English base (handles most receipts globally)
-                    det_db_thresh=0.2,  # Even lower threshold for more sensitive detection
-                    det_db_box_thresh=0.4,  # Lower threshold for box detection
-                    det_db_unclip_ratio=1.8,  # Expand text boxes slightly
+                    det_db_thresh=0.15,  # Very low threshold for max text detection
+                    det_db_box_thresh=0.3,  # Lower threshold for box detection
+                    det_db_unclip_ratio=2.0,  # Expand text boxes more
                     rec_batch_num=10,  # Process more text boxes at once
                     use_space_char=True,  # Better handling of spaces
-                    drop_score=0.3,  # Lower drop threshold to keep more text
+                    drop_score=0.2,  # Very low drop threshold to keep more text
                 )
                 ocr_ready = True
                 print("PaddleOCR ready with enhanced detection!")
@@ -497,9 +497,47 @@ def get_amount_range(currency: str) -> tuple[float, float]:
         return (0.01, 100000000)  # Default range
 
 
+def detect_region_from_text(text: str) -> str | None:
+    """Detect likely region from provider names in text"""
+    text_lower = text.lower()
+
+    # Nigerian providers
+    nigerian_providers = ['opay', 'palmpay', 'moniepoint', 'kuda', 'firstbank', 'gtbank',
+                          'access bank', 'zenith', 'uba', 'vbank', 'ecobank', 'polaris',
+                          'wema', 'fcmb', 'fidelity', 'stanbic', 'sterling', 'union bank',
+                          'vulte', 'carbon', 'fairmoney', 'mtn', 'glo', 'airtel', '9mobile',
+                          'eko disco', 'ikeja', 'ibedc', 'aedc', 'phed', 'dstv', 'gotv']
+    if any(p in text_lower for p in nigerian_providers):
+        return 'NG'
+
+    # Kenyan providers
+    kenyan_providers = ['m-pesa', 'mpesa', 'safaricom', 'equity bank', 'kcb', 'kplc', 'kenya power']
+    if any(p in text_lower for p in kenyan_providers):
+        return 'KE'
+
+    # South African providers
+    sa_providers = ['fnb', 'standard bank', 'nedbank', 'absa', 'capitec', 'vodacom', 'eskom']
+    if any(p in text_lower for p in sa_providers):
+        return 'ZA'
+
+    # Ghanaian providers
+    gh_providers = ['mtn ghana', 'vodafone ghana', 'airteltigo', 'ecg', 'ghana']
+    if any(p in text_lower for p in gh_providers):
+        return 'GH'
+
+    return None
+
+
 def extract_amount_with_currency(text: str) -> tuple[float, str]:
     """Extract monetary amount and detect currency from any global currency"""
     results = {}  # currency -> list of (amount, confidence_score)
+
+    # Detect region to prioritize local currency
+    region = detect_region_from_text(text)
+    region_currency = {
+        'NG': 'NGN', 'KE': 'KES', 'ZA': 'ZAR', 'GH': 'GHS',
+        'US': 'USD', 'GB': 'GBP', 'EU': 'EUR'
+    }.get(region)
 
     for currency, patterns in CURRENCY_PATTERNS.items():
         min_amt, max_amt = get_amount_range(currency)
@@ -557,9 +595,20 @@ def extract_amount_with_currency(text: str) -> tuple[float, str]:
     best_amount = 0
     best_confidence = 0
 
+    # If we detected a region, prioritize that currency first
+    if region_currency and region_currency in results:
+        top_match = results[region_currency][0]
+        best_currency = region_currency
+        best_amount = top_match[0]
+        best_confidence = top_match[1] + 5  # Boost confidence for region match
+        print(f"Region-based currency priority: {region} -> {region_currency}, amount={best_amount}")
+
     for currency in priority_order:
         if currency in results:
             top_match = results[currency][0]
+            # For region currency, we already handled it with boost
+            if currency == region_currency:
+                continue
             if top_match[1] > best_confidence or (top_match[1] == best_confidence and top_match[0] > best_amount):
                 best_currency = currency
                 best_amount = top_match[0]
@@ -569,6 +618,22 @@ def extract_amount_with_currency(text: str) -> tuple[float, str]:
     if not best_currency and results:
         best_currency = list(results.keys())[0]
         best_amount = results[best_currency][0][0]
+
+    # Final fallback: if we detected a region but no amount, try generic extraction with that currency
+    if not best_currency and region_currency:
+        generic_pattern = r'([\d,]+(?:\.\d{1,2})?)'
+        matches = re.findall(generic_pattern, text)
+        for match in matches:
+            try:
+                amount = float(match.replace(',', ''))
+                # For NGN, typical amounts are 50-1000000
+                if region_currency == 'NGN' and 50 <= amount <= 10000000:
+                    print(f"Generic extraction with region currency: {amount} {region_currency}")
+                    return amount, region_currency
+                elif 1 <= amount <= 100000000:
+                    return amount, region_currency
+            except ValueError:
+                continue
 
     return best_amount, best_currency or 'UNKNOWN'
 
@@ -1078,8 +1143,16 @@ async def process_image(request: OCRRequest):
             currency=currency, amount_usd=amount_usd
         )
 
+        # Debug: Log first 500 chars of extracted text to help debug OCR issues
+        print(f"OCR Text Preview: {text[:500] if len(text) > 500 else text}")
         print(f"Extracted: amount={amount} {currency}, type={bill_type}, category={bill_category}, provider={provider}")
         print(f"Validation: valid={is_valid_bill}, reason={rejection_reason}")
+
+        # If provider is Nigerian but currency isn't NGN, might be a detection issue
+        nigerian_providers = ['opay', 'palmpay', 'moniepoint', 'kuda', 'firstbank', 'gtbank',
+                              'accessbank', 'zenithbank', 'ubabank', 'vbank', 'ecobank']
+        if provider and provider.lower() in nigerian_providers and currency not in ['NGN', 'UNKNOWN']:
+            print(f"Warning: Nigerian provider {provider} detected but currency is {currency} - may be a false positive")
 
         return OCRResponse(
             success=True,
