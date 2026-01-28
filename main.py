@@ -34,10 +34,14 @@ def get_ocr():
             if ocr is None:
                 print("Initializing PaddleOCR...")
                 from paddleocr import PaddleOCR
-                # Use optimized settings for lower memory usage
+                # Use optimized settings for better accuracy
                 ocr = PaddleOCR(
-                    use_angle_cls=False,  # Skip angle classification to save memory
-                    lang='en'
+                    use_angle_cls=True,  # Enable angle classification for rotated text
+                    lang='en',
+                    det_db_thresh=0.3,  # Lower threshold for text detection (more sensitive)
+                    det_db_box_thresh=0.5,  # Lower threshold for box detection
+                    rec_batch_num=6,  # Process more text boxes at once
+                    use_space_char=True,  # Better handling of spaces
                 )
                 ocr_ready = True
                 print("PaddleOCR ready!")
@@ -92,8 +96,13 @@ class OCRResponse(BaseModel):
     provider: str | None = None  # Detected provider (OPay, PalmPay, etc.)
 
 
-def preprocess_image(img_bytes: bytes) -> np.ndarray:
-    """Preprocess image for better OCR"""
+def preprocess_image(img_bytes: bytes, aggressive: bool = False) -> np.ndarray:
+    """Preprocess image for better OCR
+
+    Args:
+        img_bytes: Raw image bytes
+        aggressive: If True, apply more aggressive preprocessing (use as fallback)
+    """
     # Load image
     img = Image.open(io.BytesIO(img_bytes))
 
@@ -101,10 +110,15 @@ def preprocess_image(img_bytes: bytes) -> np.ndarray:
     if img.mode != 'RGB':
         img = img.convert('RGB')
 
-    # Resize if too large
-    max_dim = 1500
+    # Keep images larger for better OCR (don't resize too small)
+    max_dim = 2000
     if max(img.size) > max_dim:
         ratio = max_dim / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    elif max(img.size) < 800:
+        # Upscale small images for better OCR
+        ratio = 800 / max(img.size)
         new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
         img = img.resize(new_size, Image.Resampling.LANCZOS)
 
@@ -112,26 +126,33 @@ def preprocess_image(img_bytes: bytes) -> np.ndarray:
     img_np = np.array(img)
     img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-    # Denoise
-    img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
+    if aggressive:
+        # Only apply aggressive preprocessing as fallback
+        # Light denoise (less aggressive)
+        img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, 3, 3, 7, 21)
 
-    # Enhance contrast
-    lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    img_cv = cv2.merge([l, a, b])
-    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_LAB2BGR)
+        # Enhance contrast
+        lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        img_cv = cv2.merge([l, a, b])
+        img_cv = cv2.cvtColor(img_cv, cv2.COLOR_LAB2BGR)
 
     return img_cv
 
 
-def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
-    """Extract text using PaddleOCR"""
+def extract_text(img_cv: np.ndarray, min_confidence: float = 0.3) -> tuple[str, float]:
+    """Extract text using PaddleOCR
+
+    Args:
+        img_cv: OpenCV image in BGR format
+        min_confidence: Minimum confidence threshold for text lines
+    """
     ocr_instance = get_ocr()
 
     try:
-        # Call OCR without extra parameters (new PaddleOCR API)
+        # Call OCR
         result = ocr_instance.ocr(img_cv)
         print(f"OCR result type: {type(result)}, has content: {bool(result)}")
 
@@ -146,13 +167,14 @@ def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
             if line and len(line) >= 2:
                 text = line[1][0]
                 conf = line[1][1]
-                if conf > 0.5:
+                # Lower confidence threshold to capture more text
+                if conf > min_confidence:
                     lines.append(str(text))
                     confidences.append(conf)
 
         full_text = '\n'.join(lines)
         avg_conf = sum(confidences) / len(confidences) if confidences else 0
-        print(f"Extracted {len(lines)} lines, avg confidence: {avg_conf:.2f}")
+        print(f"Extracted {len(lines)} lines, {len(full_text)} chars, avg confidence: {avg_conf:.2f}")
 
         return full_text, avg_conf
 
@@ -160,6 +182,35 @@ def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
         print(f"OCR extraction error: {e}")
         traceback.print_exc()
         raise
+
+
+def extract_text_with_retry(img_bytes: bytes) -> tuple[str, float, np.ndarray]:
+    """Extract text with retry using different preprocessing strategies
+
+    Returns: (text, confidence, processed_image)
+    """
+    # Strategy 1: Minimal preprocessing (best for clean screenshots)
+    print("OCR Strategy 1: Minimal preprocessing...")
+    img_cv = preprocess_image(img_bytes, aggressive=False)
+    text, conf = extract_text(img_cv, min_confidence=0.3)
+
+    # If we got good results, return them
+    if len(text) > 50 and conf > 0.6:
+        print(f"Strategy 1 succeeded: {len(text)} chars, {conf:.2f} confidence")
+        return text, conf, img_cv
+
+    # Strategy 2: Try with aggressive preprocessing
+    print("OCR Strategy 2: Aggressive preprocessing...")
+    img_cv_aggressive = preprocess_image(img_bytes, aggressive=True)
+    text2, conf2 = extract_text(img_cv_aggressive, min_confidence=0.25)
+
+    # Use whichever got more text
+    if len(text2) > len(text):
+        print(f"Strategy 2 better: {len(text2)} chars vs {len(text)} chars")
+        return text2, conf2, img_cv_aggressive
+    else:
+        print(f"Strategy 1 kept: {len(text)} chars")
+        return text, conf, img_cv
 
 
 # Comprehensive global currency support
@@ -674,15 +725,10 @@ async def process_image(request: OCRRequest):
             print(f"Base64 decode error: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
 
-        # Preprocess
-        print("Preprocessing image...")
-        img_cv = preprocess_image(img_bytes)
-        print(f"Preprocessed image shape: {img_cv.shape}")
-
-        # Extract text
-        print("Extracting text...")
-        text, confidence = extract_text(img_cv)
-        print(f"Text extraction complete: {len(text)} chars, confidence: {confidence:.2f}")
+        # Extract text with retry strategies
+        print("Starting OCR extraction...")
+        text, confidence, img_cv = extract_text_with_retry(img_bytes)
+        print(f"Final extraction: {len(text)} chars, confidence: {confidence:.2f}")
 
         if not text:
             return OCRResponse(
