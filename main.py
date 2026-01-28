@@ -124,8 +124,8 @@ def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
     ocr_instance = get_ocr()
 
     try:
-        # Use cls=False to disable angle classification (avoids issues with newer PaddleOCR)
-        result = ocr_instance.ocr(img_cv, cls=False)
+        # Call OCR without extra parameters (new PaddleOCR API)
+        result = ocr_instance.ocr(img_cv)
         print(f"OCR result type: {type(result)}, has content: {bool(result)}")
 
         if not result or not result[0]:
