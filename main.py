@@ -46,8 +46,9 @@ def get_ocr():
 def init_ocr_on_startup():
     """Initialize OCR on app startup in a background thread"""
     import time
-    time.sleep(2)  # Wait for app to fully start
+    time.sleep(10)  # Wait longer for app to fully start and pass healthcheck
     try:
+        print("Starting OCR pre-initialization...")
         get_ocr()
         print("OCR pre-initialized successfully")
     except Exception as e:
