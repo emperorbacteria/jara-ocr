@@ -34,17 +34,19 @@ def get_ocr():
             if ocr is None:
                 print("Initializing PaddleOCR...")
                 from paddleocr import PaddleOCR
-                # Use optimized settings for better accuracy
+                # Use optimized settings for better accuracy (multilingual)
                 ocr = PaddleOCR(
                     use_angle_cls=True,  # Enable angle classification for rotated text
-                    lang='en',
-                    det_db_thresh=0.3,  # Lower threshold for text detection (more sensitive)
-                    det_db_box_thresh=0.5,  # Lower threshold for box detection
-                    rec_batch_num=6,  # Process more text boxes at once
+                    lang='en',  # English base (handles most receipts globally)
+                    det_db_thresh=0.2,  # Even lower threshold for more sensitive detection
+                    det_db_box_thresh=0.4,  # Lower threshold for box detection
+                    det_db_unclip_ratio=1.8,  # Expand text boxes slightly
+                    rec_batch_num=10,  # Process more text boxes at once
                     use_space_char=True,  # Better handling of spaces
+                    drop_score=0.3,  # Lower drop threshold to keep more text
                 )
                 ocr_ready = True
-                print("PaddleOCR ready!")
+                print("PaddleOCR ready with enhanced detection!")
     return ocr
 
 def init_ocr_on_startup():
@@ -59,14 +61,43 @@ def init_ocr_on_startup():
         print(f"OCR initialization error: {e}")
         traceback.print_exc()
 
-# Utility keywords for bill detection
+# Global utility keywords for bill detection (weighted by confidence)
 UTILITY_KEYWORDS = {
-    'airtime': 3, 'data': 3, 'electricity': 4, 'water': 3, 'gas': 3,
-    'internet': 3, 'phone': 2, 'glo': 3, 'mtn': 3, 'airtel': 3, '9mobile': 3,
-    'kwh': 4, 'meter': 4, 'recharge': 2, 'successful': 2, 'transaction': 2,
-    'receipt': 2, 'paid': 2, 'credited': 2, 'debit': 2, 'transfer': 2,
-    'units': 3, 'token': 3, 'vend': 3, 'prepaid': 3, 'postpaid': 3,
-    'bank': 2, 'payment': 2, 'confirmed': 2
+    # Universal utility terms
+    'airtime': 4, 'data': 3, 'electricity': 4, 'water': 3, 'gas': 3,
+    'internet': 3, 'broadband': 3, 'wifi': 3, 'phone': 2, 'mobile': 2,
+    'recharge': 3, 'top up': 3, 'topup': 3, 'top-up': 3,
+    'kwh': 4, 'meter': 3, 'units': 3, 'token': 3, 'vend': 3,
+    'prepaid': 3, 'postpaid': 3, 'bill': 2, 'utility': 3,
+    'successful': 2, 'transaction': 2, 'receipt': 2, 'paid': 2, 'payment': 2,
+
+    # Nigerian telcos
+    'glo': 3, 'mtn': 3, 'airtel': 3, '9mobile': 3, 'etisalat': 3,
+
+    # Global telcos
+    'vodafone': 3, 'orange': 3, 'safaricom': 3, 't-mobile': 3, 'verizon': 3,
+    'at&t': 3, 'sprint': 3, 'ee': 3, 'three': 2, 'o2': 3, 'jio': 3,
+    'aircel': 3, 'idea': 3, 'bsnl': 3, 'tigo': 3, 'movistar': 3,
+    'claro': 3, 'telcel': 3, 'digicel': 3, 'econet': 3, 'telecel': 3,
+
+    # Electricity companies (global)
+    'eko': 3, 'ikeja': 3, 'ibedc': 3, 'aedc': 3, 'phed': 3, 'eedc': 3,  # Nigeria
+    'eskom': 3, 'city power': 3,  # South Africa
+    'ecg': 3, 'nedco': 3,  # Ghana
+    'kplc': 3, 'kenya power': 3,  # Kenya
+    'tanesco': 3,  # Tanzania
+    'umeme': 3,  # Uganda
+    'zesco': 3,  # Zambia
+    'enel': 3, 'iberdrola': 3, 'edf': 3,  # Europe
+    'pge': 3, 'duke energy': 3, 'con edison': 3,  # USA
+
+    # Cable/TV
+    'cable': 3, 'tv': 2, 'dstv': 3, 'gotv': 3, 'startimes': 3, 'showmax': 3,
+    'netflix': 3, 'hulu': 3, 'disney': 2, 'hbo': 2, 'prime video': 2,
+    'multichoice': 3, 'sky': 2, 'directv': 3,
+
+    # Generic payment terms
+    'confirmed': 2, 'approved': 2, 'completed': 2, 'success': 2,
 }
 
 
@@ -484,48 +515,149 @@ def extract_date_time(text: str) -> tuple[str | None, str | None]:
 
 
 def detect_bill_type(text: str) -> tuple[str, str]:
-    """Detect type of bill and category
+    """Detect type of bill and category (GLOBAL support)
     Returns: (bill_type, bill_category)
     Categories: 'utility', 'transfer', 'deposit', 'unknown'
     """
     text_lower = text.lower()
 
-    # Check for UTILITY BILLS first (these are VALID)
-    if any(kw in text_lower for kw in ['airtime', 'recharge', 'top up', 'topup', 'top-up']):
+    # ===== AIRTIME / MOBILE TOP-UP (Global) =====
+    airtime_keywords = [
+        'airtime', 'recharge', 'top up', 'topup', 'top-up', 'mobile credit',
+        'phone credit', 'call credit', 'prepaid credit', 'recarga', 'recarrega',
+        'aufladung', 'ricarica', 'пополнение',  # Spanish, Portuguese, German, Italian, Russian
+    ]
+    # Telco names that indicate airtime
+    telco_names = [
+        'mtn', 'glo', 'airtel', '9mobile', 'etisalat',  # Nigeria
+        'safaricom', 'airtel kenya', 'telkom kenya',  # Kenya
+        'vodacom', 'cell c', 'telkom',  # South Africa
+        'vodafone', 'mtn ghana', 'airteltigo',  # Ghana
+        'orange', 'moov', 'togocel',  # West Africa
+        't-mobile', 'verizon', 'at&t', 'sprint',  # USA
+        'ee', 'o2', 'three', 'vodafone uk',  # UK
+        'jio', 'vi', 'bsnl', 'airtel india',  # India
+        'claro', 'movistar', 'telcel',  # Latin America
+        'digicel',  # Caribbean
+    ]
+    if any(kw in text_lower for kw in airtime_keywords):
         return 'airtime', 'utility'
-    elif any(kw in text_lower for kw in ['data', 'bundle']) and any(kw in text_lower for kw in ['gb', 'mb', 'plan', 'glo', 'mtn', 'airtel', '9mobile']):
+    if any(telco in text_lower for telco in telco_names) and any(kw in text_lower for kw in ['successful', 'completed', 'paid', 'receipt', 'transaction']):
+        return 'airtime', 'utility'
+
+    # ===== DATA BUNDLE (Global) =====
+    data_keywords = ['data', 'bundle', 'internet pack', 'data plan', 'mb', 'gb', 'datos', 'données']
+    data_context = ['plan', 'package', 'bundle', 'subscription', 'validity', 'valid for']
+    if any(kw in text_lower for kw in data_keywords) and any(ctx in text_lower for ctx in data_context + telco_names):
         return 'data', 'utility'
-    elif any(kw in text_lower for kw in ['electricity', 'kwh', 'meter', 'phcn', 'eko', 'ikeja', 'ibedc', 'aedc', 'disco', 'prepaid meter', 'postpaid']):
+
+    # ===== ELECTRICITY (Global) =====
+    electricity_keywords = [
+        'electricity', 'electric', 'power', 'kwh', 'kilowatt', 'meter', 'energia',
+        'électricité', 'strom', 'elettricità', 'электричество',
+        'prepaid meter', 'postpaid', 'token', 'units', 'vend',
+    ]
+    electricity_providers = [
+        # Nigeria
+        'eko disco', 'ikeja', 'ibedc', 'aedc', 'phed', 'eedc', 'kedco', 'kaedco', 'bedc', 'jedc',
+        # South Africa
+        'eskom', 'city power', 'cape town electricity',
+        # Ghana
+        'ecg', 'nedco', 'ghana grid',
+        # Kenya
+        'kplc', 'kenya power',
+        # Other Africa
+        'tanesco', 'umeme', 'zesco', 'escom', 'eswatini electricity',
+        # International
+        'enel', 'iberdrola', 'edf', 'engie', 'e.on', 'vattenfall',
+        'pge', 'duke energy', 'con edison', 'florida power', 'southern company',
+    ]
+    if any(kw in text_lower for kw in electricity_keywords):
         return 'electricity', 'utility'
-    elif any(kw in text_lower for kw in ['water', 'fctwb', 'water board', 'water bill']):
+    if any(provider in text_lower for provider in electricity_providers):
+        return 'electricity', 'utility'
+
+    # ===== WATER (Global) =====
+    water_keywords = [
+        'water', 'água', 'eau', 'wasser', 'acqua', 'вода',
+        'water bill', 'water utility', 'water board', 'water corp',
+    ]
+    water_providers = ['fctwb', 'lagos water', 'rand water', 'joburg water', 'cape town water']
+    if any(kw in text_lower for kw in water_keywords):
         return 'water', 'utility'
-    elif any(kw in text_lower for kw in ['internet', 'wifi', 'broadband', 'fiber', 'spectranet', 'smile']):
+    if any(provider in text_lower for provider in water_providers):
+        return 'water', 'utility'
+
+    # ===== INTERNET / BROADBAND (Global) =====
+    internet_keywords = [
+        'internet', 'wifi', 'broadband', 'fiber', 'fibre', 'dsl', 'router',
+        'isp', 'home internet', 'business internet',
+    ]
+    internet_providers = [
+        'spectranet', 'smile', 'swift', 'ipnx', 'coollink',  # Nigeria
+        'comcast', 'xfinity', 'spectrum', 'cox',  # USA
+        'bt', 'virgin media', 'sky broadband', 'talktalk',  # UK
+        'telkom', 'mweb', 'afrihost',  # South Africa
+    ]
+    if any(kw in text_lower for kw in internet_keywords):
         return 'internet', 'utility'
-    elif any(kw in text_lower for kw in ['gas', 'cooking gas', 'lpg']):
+    if any(provider in text_lower for provider in internet_providers):
+        return 'internet', 'utility'
+
+    # ===== GAS (Global) =====
+    gas_keywords = ['gas', 'natural gas', 'cooking gas', 'lpg', 'propane', 'butane', 'gaz']
+    if any(kw in text_lower for kw in gas_keywords) and not 'vegas' in text_lower:
         return 'gas', 'utility'
-    elif any(kw in text_lower for kw in ['cable', 'tv', 'dstv', 'gotv', 'startimes', 'showmax']):
+
+    # ===== CABLE / TV / STREAMING (Global) =====
+    cable_keywords = [
+        'cable', 'satellite', 'tv subscription', 'television',
+        'dstv', 'gotv', 'startimes', 'showmax',  # Africa
+        'netflix', 'hulu', 'disney+', 'hbo', 'prime video', 'youtube premium',
+        'sky', 'directv', 'dish network', 'sling',  # International
+        'multichoice',
+    ]
+    if any(kw in text_lower for kw in cable_keywords):
         return 'cable', 'utility'
-    elif any(kw in text_lower for kw in ['betting', 'bet9ja', 'sportybet', 'betway', 'nairabet', '1xbet']):
+
+    # ===== BETTING / GAMING (Global) =====
+    betting_keywords = [
+        'bet9ja', 'sportybet', 'betway', 'nairabet', '1xbet', 'betking',
+        'fanduel', 'draftkings', 'betmgm', 'caesars', 'bet365',
+        'paddy power', 'william hill', 'ladbrokes', 'betfair',
+    ]
+    if any(kw in text_lower for kw in betting_keywords):
         return 'betting', 'utility'
 
-    # Check for TRANSFERS (NOT VALID utility bills)
+    # ===== Check for TRANSFERS (NOT VALID utility bills) =====
     transfer_keywords = [
         'transfer', 'bank transfer', 'inter-bank', 'interbank', 'nip transfer',
+        'wire transfer', 'money transfer', 'funds transfer',
         'beneficiary', 'sender', 'recipient account', 'destination bank',
-        'from:', 'to:', 'narration', 'other local banks'
+        'narration', 'other local banks', 'swift', 'iban',
+    ]
+    # But check if it's actually a utility payment via bank transfer first
+    utility_via_transfer = [
+        'vbank|glo', 'vbank|mtn', 'vbank|airtel', 'chamswitch|',
+        'airtime|', 'data|', 'electricity|', 'dstv|', 'gotv|',
     ]
     if any(kw in text_lower for kw in transfer_keywords):
-        # But check if it's actually a utility payment via transfer
-        if any(kw in text_lower for kw in ['vbank|glo', 'vbank|mtn', 'vbank|airtel', 'chamswitch|', 'airtime|', 'data|']):
-            # This is a utility bill paid via bank
+        if any(util in text_lower for util in utility_via_transfer):
             if 'data|' in text_lower or 'data bundle' in text_lower:
                 return 'data', 'utility'
+            elif 'electricity' in text_lower or 'disco' in text_lower:
+                return 'electricity', 'utility'
+            elif 'dstv' in text_lower or 'gotv' in text_lower:
+                return 'cable', 'utility'
             else:
                 return 'airtime', 'utility'
         return 'transfer', 'transfer'
 
-    # Check for DEPOSITS (NOT VALID)
-    deposit_keywords = ['deposit', 'bank deposit', 'credited to', 'credit alert', 'inward transfer']
+    # ===== Check for DEPOSITS (NOT VALID) =====
+    deposit_keywords = [
+        'deposit', 'bank deposit', 'credited to', 'credit alert',
+        'inward transfer', 'incoming transfer', 'received from',
+    ]
     if any(kw in text_lower for kw in deposit_keywords):
         return 'deposit', 'deposit'
 
@@ -534,16 +666,17 @@ def detect_bill_type(text: str) -> tuple[str, str]:
 
 
 def detect_provider(text: str) -> str | None:
-    """Detect the payment provider from the receipt"""
+    """Detect the payment provider from the receipt (GLOBAL support)"""
     text_lower = text.lower()
 
     providers = {
+        # Nigerian Banks & Fintechs
         'opay': ['opay', 'o-pay'],
         'palmpay': ['palmpay', 'palm pay'],
         'moniepoint': ['moniepoint', 'monie point'],
         'kuda': ['kuda'],
         'firstbank': ['firstbank', 'first bank', 'firstmobile'],
-        'gtbank': ['gtbank', 'gt bank', 'guaranty'],
+        'gtbank': ['gtbank', 'gt bank', 'guaranty trust'],
         'accessbank': ['access bank', 'accessbank', 'accessmore'],
         'zenithbank': ['zenith bank', 'zenithbank'],
         'ubabank': ['uba', 'united bank for africa'],
@@ -555,14 +688,63 @@ def detect_provider(text: str) -> str | None:
         'fidelity': ['fidelity'],
         'stanbic': ['stanbic', 'stanbic ibtc'],
         'sterling': ['sterling'],
-        'union': ['union bank'],
+        'unionbank': ['union bank'],
         'vulte': ['vulte', 'vul-te'],
         'carbon': ['carbon', 'paylater'],
         'fairmoney': ['fairmoney', 'fair money'],
+
+        # Nigerian Telcos
         'glo': ['glo', 'globacom'],
-        'mtn': ['mtn'],
-        'airtel': ['airtel'],
+        'mtn_ng': ['mtn nigeria', 'mtn ng'],
+        'airtel_ng': ['airtel nigeria'],
         '9mobile': ['9mobile', 'etisalat'],
+
+        # Kenyan
+        'mpesa': ['m-pesa', 'mpesa', 'safaricom'],
+        'equitybank': ['equity bank', 'equity mobile'],
+        'kcb': ['kcb', 'kenya commercial'],
+
+        # South African
+        'fnb': ['fnb', 'first national bank'],
+        'standardbank': ['standard bank'],
+        'nedbank': ['nedbank'],
+        'absa': ['absa', 'barclays'],
+        'capitec': ['capitec'],
+
+        # Ghanaian
+        'mtn_gh': ['mtn ghana'],
+        'vodafone_gh': ['vodafone ghana'],
+        'airteltigo': ['airteltigo'],
+
+        # Global Mobile Money
+        'mtn_momo': ['mtn mobile money', 'momo', 'mobile money'],
+        'orange_money': ['orange money'],
+
+        # International Banks
+        'chase': ['chase', 'jpmorgan'],
+        'bofa': ['bank of america', 'bofa'],
+        'wells_fargo': ['wells fargo'],
+        'citibank': ['citibank', 'citi'],
+        'hsbc': ['hsbc'],
+        'barclays_uk': ['barclays'],
+        'lloyds': ['lloyds'],
+        'natwest': ['natwest'],
+
+        # Global Fintechs
+        'paypal': ['paypal'],
+        'venmo': ['venmo'],
+        'cashapp': ['cash app', 'cashapp', 'square cash'],
+        'revolut': ['revolut'],
+        'wise': ['wise', 'transferwise'],
+        'payoneer': ['payoneer'],
+        'skrill': ['skrill'],
+        'neteller': ['neteller'],
+
+        # Payment Processors
+        'stripe': ['stripe'],
+        'flutterwave': ['flutterwave'],
+        'paystack': ['paystack'],
+        'interswitch': ['interswitch', 'quickteller'],
     }
 
     for provider, keywords in providers.items():
@@ -622,9 +804,10 @@ def parse_receipt_date(date_str: str | None, time_str: str | None = None) -> str
 
 
 def validate_bill(bill_type: str, bill_category: str, amount: float,
-                  receipt_date_iso: str | None, utility_score: int) -> tuple[bool, str | None]:
+                  receipt_date_iso: str | None, utility_score: int,
+                  currency: str = 'NGN', amount_usd: float = 0) -> tuple[bool, str | None]:
     """
-    Validate if a bill should be approved or rejected.
+    Validate if a bill should be approved or rejected (GLOBAL support).
     Returns: (is_valid, rejection_reason)
     """
     from datetime import datetime, timedelta
@@ -642,10 +825,13 @@ def validate_bill(bill_type: str, bill_category: str, amount: float,
     if amount <= 0:
         return False, "Could not detect bill amount. Please ensure the amount is clearly visible."
 
-    # Rule 3: Minimum amount threshold (e.g., 50 NGN minimum)
-    MIN_AMOUNT_NGN = 50
-    if amount < MIN_AMOUNT_NGN:
-        return False, f"Bill amount (₦{amount:.2f}) is below minimum threshold of ₦{MIN_AMOUNT_NGN}."
+    # Rule 3: Minimum amount threshold (currency-aware)
+    # Use USD equivalent for global comparison (~$0.03 minimum)
+    MIN_AMOUNT_USD = 0.03
+    actual_usd = amount_usd if amount_usd > 0 else amount * 0.000625  # Fallback to NGN rate
+
+    if actual_usd < MIN_AMOUNT_USD:
+        return False, f"Bill amount is below minimum threshold (equivalent to ~${MIN_AMOUNT_USD:.2f} USD)."
 
     # Rule 4: Check receipt age (must be within 24 hours)
     if receipt_date_iso:
@@ -666,9 +852,17 @@ def validate_bill(bill_type: str, bill_category: str, amount: float,
             pass  # If we can't parse the date, we'll allow it for manual review
 
     # Rule 5: Utility score threshold
-    MIN_UTILITY_SCORE = 4
+    # If we confidently identified a specific utility type, lower the threshold
+    KNOWN_UTILITY_TYPES = ['airtime', 'data', 'electricity', 'water', 'gas', 'internet', 'cable', 'betting']
+    if bill_type in KNOWN_UTILITY_TYPES:
+        # We identified a specific utility type, be more lenient
+        MIN_UTILITY_SCORE = 2
+    else:
+        # Unknown type, require higher confidence
+        MIN_UTILITY_SCORE = 4
+
     if utility_score < MIN_UTILITY_SCORE:
-        return False, f"Receipt does not appear to be a valid utility bill (score: {utility_score}/{MIN_UTILITY_SCORE} required)."
+        return False, f"Receipt does not appear to be a valid utility bill (confidence too low)."
 
     # All checks passed
     return True, None
@@ -761,9 +955,10 @@ async def process_image(request: OCRRequest):
         provider = detect_provider(text)
         receipt_date_iso = parse_receipt_date(date, time)
 
-        # Validate the bill
+        # Validate the bill (with currency-aware thresholds)
         is_valid_bill, rejection_reason = validate_bill(
-            bill_type, bill_category, amount, receipt_date_iso, utility_score
+            bill_type, bill_category, amount, receipt_date_iso, utility_score,
+            currency=currency, amount_usd=amount_usd
         )
 
         print(f"Extracted: amount={amount} {currency}, type={bill_type}, category={bill_category}, provider={provider}")
