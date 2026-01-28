@@ -24,9 +24,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download PaddleOCR models during build
-RUN python -c "from paddleocr import PaddleOCR; ocr = PaddleOCR(use_angle_cls=False, lang='en'); print('Models downloaded successfully')"
-
 # Copy application code
 COPY . .
 
