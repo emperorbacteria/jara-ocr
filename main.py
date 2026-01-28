@@ -37,8 +37,7 @@ def get_ocr():
                 # Use optimized settings for lower memory usage
                 ocr = PaddleOCR(
                     use_textline_orientation=False,  # Skip angle classification to save memory
-                    lang='en',
-                    show_log=False  # Reduce log noise
+                    lang='en'
                 )
                 ocr_ready = True
                 print("PaddleOCR ready!")
