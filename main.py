@@ -135,8 +135,8 @@ Return ONLY the JSON object, no other text."""
 async def analyze_with_gemini(image_bytes: bytes) -> dict:
     """Use Gemini Vision to analyze receipt image"""
     try:
-        # Initialize model
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Initialize model - using gemini-2.0-flash-exp for better vision
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
 
         # Create image part
         image_part = {
