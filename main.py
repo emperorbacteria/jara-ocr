@@ -458,12 +458,13 @@ def build_currency_patterns():
             patterns[code].append(rf'{escaped}\s*([\d,]+(?:\.\d{{1,2}})?)')
             patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*{escaped}')
 
-    # Code-based patterns
+    # Code-based patterns - always use word boundaries to avoid false positives
     for code in CURRENCY_CODES:
         if code not in patterns:
             patterns[code] = []
-        patterns[code].append(rf'(?:{code})\s*([\d,]+(?:\.\d{{1,2}})?)')
-        patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*(?:{code})')
+        # Use word boundaries for ALL currency codes to prevent matching within garbage text
+        patterns[code].append(rf'\b{code}\b\s*([\d,]+(?:\.\d{{1,2}})?)')
+        patterns[code].append(rf'([\d,]+(?:\.\d{{1,2}})?)\s*\b{code}\b')
 
     # Add generic amount patterns for NGN (common Nigerian format)
     if 'NGN' in patterns:
@@ -619,21 +620,37 @@ def extract_amount_with_currency(text: str) -> tuple[float, str]:
         best_currency = list(results.keys())[0]
         best_amount = results[best_currency][0][0]
 
-    # Final fallback: if we detected a region but no amount, try generic extraction with that currency
-    if not best_currency and region_currency:
-        generic_pattern = r'([\d,]+(?:\.\d{1,2})?)'
-        matches = re.findall(generic_pattern, text)
-        for match in matches:
-            try:
-                amount = float(match.replace(',', ''))
-                # For NGN, typical amounts are 50-1000000
-                if region_currency == 'NGN' and 50 <= amount <= 10000000:
-                    print(f"Generic extraction with region currency: {amount} {region_currency}")
-                    return amount, region_currency
-                elif 1 <= amount <= 100000000:
-                    return amount, region_currency
-            except ValueError:
-                continue
+    # Final fallback: if we detected a region but no good amount, try generic extraction
+    if region_currency:
+        # If best amount seems wrong (too small for region), override with generic extraction
+        should_try_generic = (
+            not best_currency or
+            (region_currency == 'NGN' and best_amount < 50) or
+            (region_currency != 'NGN' and best_amount < 1)
+        )
+
+        if should_try_generic:
+            # Look for amounts that look like bill payments (e.g., 11000.00, 5,000, 200.00)
+            generic_pattern = r'([\d,]+\.\d{2}|\d{1,3}(?:,\d{3})+|\d{3,})'
+            matches = re.findall(generic_pattern, text)
+
+            valid_amounts = []
+            for match in matches:
+                try:
+                    amount = float(match.replace(',', ''))
+                    # For NGN, typical amounts are 50-10000000
+                    if region_currency == 'NGN' and 50 <= amount <= 10000000:
+                        valid_amounts.append(amount)
+                    elif region_currency != 'NGN' and 1 <= amount <= 100000000:
+                        valid_amounts.append(amount)
+                except ValueError:
+                    continue
+
+            if valid_amounts:
+                # Take the largest reasonable amount (likely the transaction amount)
+                best_generic = max(valid_amounts)
+                print(f"Generic extraction with region currency: {best_generic} {region_currency} (overriding {best_amount} {best_currency})")
+                return best_generic, region_currency
 
     return best_amount, best_currency or 'UNKNOWN'
 
