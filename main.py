@@ -1,3 +1,8 @@
+import os
+# Disable oneDNN/MKL-DNN to avoid compatibility issues
+os.environ['FLAGS_use_mkldnn'] = '0'
+os.environ['MKLDNN_VERBOSE'] = '0'
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,7 +12,6 @@ from PIL import Image
 import base64
 import io
 import re
-import os
 import threading
 import traceback
 
