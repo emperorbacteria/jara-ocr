@@ -905,9 +905,11 @@ def detect_bill_type(text: str) -> tuple[str, str]:
     # Check for amount pattern
     has_amount = bool(re.search(r'\d{2,}[.,]\d{2}|\d{3,}', text))
 
-    # If it looks like a payment receipt, classify as "payment" needing manual review
+    # If it looks like a payment receipt but we can't identify type,
+    # mark as 'unclear' - needs MANUAL review, should NOT auto-approve
+    # This could be a transfer, deposit, or utility - we can't tell from poor OCR
     if (has_receipt_markers >= 2) or (has_provider and has_amount):
-        return 'payment', 'utility'  # Treat as utility payment, needs manual review for exact type
+        return 'unclear', 'needs_review'  # Needs manual review - could be transfer/deposit/utility
 
     # Unknown - needs manual review
     return 'unknown', 'unknown'
@@ -1066,6 +1068,11 @@ def validate_bill(bill_type: str, bill_category: str, amount: float,
             return False, "Bank transfers are not eligible. Only utility bill payments (airtime, data, electricity, etc.) are accepted."
         elif bill_category == 'deposit':
             return False, "Bank deposits are not eligible. Only utility bill payments are accepted."
+        elif bill_category == 'needs_review':
+            # Could be utility, transfer, or deposit - OCR wasn't clear enough
+            # Return False with no rejection reason - won't auto-reject, won't auto-approve
+            # Bill stays in 'pending' for manual admin review
+            return False, None  # Needs manual review
         else:
             return False, "Unable to identify bill type. Please upload a clear utility bill receipt."
 
@@ -1106,10 +1113,10 @@ def validate_bill(bill_type: str, bill_category: str, amount: float,
     if bill_type in KNOWN_UTILITY_TYPES:
         # We identified a specific utility type, be more lenient
         MIN_UTILITY_SCORE = 2
-    elif bill_type == 'payment':
-        # Generic payment detected (has provider + amount but couldn't identify exact type)
-        # Be lenient since it looks like a valid payment receipt
-        MIN_UTILITY_SCORE = 1
+    elif bill_type == 'unclear':
+        # Receipt detected but type unknown - should have been caught earlier
+        # This code path shouldn't be reached due to needs_review category check above
+        MIN_UTILITY_SCORE = 100  # Impossible to meet, forces manual review
     else:
         # Unknown type, require higher confidence
         MIN_UTILITY_SCORE = 4
