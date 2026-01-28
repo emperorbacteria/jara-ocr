@@ -215,33 +215,141 @@ def extract_text(img_cv: np.ndarray, min_confidence: float = 0.3) -> tuple[str, 
         raise
 
 
+def preprocess_grayscale_binary(img_bytes: bytes) -> np.ndarray:
+    """Preprocess with grayscale and adaptive thresholding for difficult images"""
+    img = Image.open(io.BytesIO(img_bytes))
+
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    # Keep larger size for OCR
+    max_dim = 2000
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    elif max(img.size) < 1000:
+        ratio = 1000 / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    img_np = np.array(img)
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+
+    # Apply adaptive thresholding for better text extraction
+    # This works well for receipts with varying backgrounds
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+
+    # Convert back to BGR for PaddleOCR
+    img_processed = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    return img_processed
+
+
+def preprocess_sharpen(img_bytes: bytes) -> np.ndarray:
+    """Preprocess with sharpening for blurry images"""
+    img = Image.open(io.BytesIO(img_bytes))
+
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    max_dim = 2000
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    elif max(img.size) < 1000:
+        ratio = 1000 / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+    img_np = np.array(img)
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+    # Apply sharpening kernel
+    kernel = np.array([[-1, -1, -1],
+                       [-1,  9, -1],
+                       [-1, -1, -1]])
+    img_sharp = cv2.filter2D(img_cv, -1, kernel)
+
+    # Reduce noise slightly
+    img_sharp = cv2.bilateralFilter(img_sharp, 9, 75, 75)
+
+    return img_sharp
+
+
 def extract_text_with_retry(img_bytes: bytes) -> tuple[str, float, np.ndarray]:
     """Extract text with retry using different preprocessing strategies
 
     Returns: (text, confidence, processed_image)
     """
+    best_text = ""
+    best_conf = 0.0
+    best_img = None
+
     # Strategy 1: Minimal preprocessing (best for clean screenshots)
     print("OCR Strategy 1: Minimal preprocessing...")
     img_cv = preprocess_image(img_bytes, aggressive=False)
-    text, conf = extract_text(img_cv, min_confidence=0.3)
+    text1, conf1 = extract_text(img_cv, min_confidence=0.3)
+
+    if len(text1) > len(best_text):
+        best_text, best_conf, best_img = text1, conf1, img_cv
 
     # If we got good results, return them
-    if len(text) > 50 and conf > 0.6:
-        print(f"Strategy 1 succeeded: {len(text)} chars, {conf:.2f} confidence")
-        return text, conf, img_cv
+    if len(text1) > 100 and conf1 > 0.7:
+        print(f"Strategy 1 succeeded: {len(text1)} chars, {conf1:.2f} confidence")
+        return text1, conf1, img_cv
 
-    # Strategy 2: Try with aggressive preprocessing
-    print("OCR Strategy 2: Aggressive preprocessing...")
+    # Strategy 2: CLAHE contrast enhancement
+    print("OCR Strategy 2: Contrast enhancement...")
     img_cv_aggressive = preprocess_image(img_bytes, aggressive=True)
     text2, conf2 = extract_text(img_cv_aggressive, min_confidence=0.25)
 
-    # Use whichever got more text
-    if len(text2) > len(text):
-        print(f"Strategy 2 better: {len(text2)} chars vs {len(text)} chars")
+    if len(text2) > len(best_text):
+        best_text, best_conf, best_img = text2, conf2, img_cv_aggressive
+
+    if len(text2) > 100 and conf2 > 0.7:
+        print(f"Strategy 2 succeeded: {len(text2)} chars, {conf2:.2f} confidence")
         return text2, conf2, img_cv_aggressive
-    else:
-        print(f"Strategy 1 kept: {len(text)} chars")
-        return text, conf, img_cv
+
+    # Strategy 3: Grayscale with adaptive thresholding (good for colored backgrounds)
+    print("OCR Strategy 3: Grayscale + binarization...")
+    try:
+        img_cv_binary = preprocess_grayscale_binary(img_bytes)
+        text3, conf3 = extract_text(img_cv_binary, min_confidence=0.2)
+
+        if len(text3) > len(best_text):
+            best_text, best_conf, best_img = text3, conf3, img_cv_binary
+
+        if len(text3) > 100:
+            print(f"Strategy 3 succeeded: {len(text3)} chars, {conf3:.2f} confidence")
+            return text3, conf3, img_cv_binary
+    except Exception as e:
+        print(f"Strategy 3 failed: {e}")
+
+    # Strategy 4: Sharpening (good for blurry images)
+    print("OCR Strategy 4: Sharpening...")
+    try:
+        img_cv_sharp = preprocess_sharpen(img_bytes)
+        text4, conf4 = extract_text(img_cv_sharp, min_confidence=0.2)
+
+        if len(text4) > len(best_text):
+            best_text, best_conf, best_img = text4, conf4, img_cv_sharp
+
+        if len(text4) > 100:
+            print(f"Strategy 4 succeeded: {len(text4)} chars, {conf4:.2f} confidence")
+            return text4, conf4, img_cv_sharp
+    except Exception as e:
+        print(f"Strategy 4 failed: {e}")
+
+    # Return the best result we got
+    print(f"Best result: {len(best_text)} chars, {best_conf:.2f} confidence")
+    return best_text, best_conf, best_img if best_img is not None else img_cv
 
 
 # Comprehensive global currency support
