@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Set environment variables to disable oneDNN BEFORE installing paddle
+ENV FLAGS_use_mkldnn=0
+ENV MKLDNN_VERBOSE=0
+
 # Copy requirements first for caching
 COPY requirements.txt .
 

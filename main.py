@@ -1,8 +1,3 @@
-import os
-# Disable oneDNN/MKL-DNN to avoid compatibility issues
-os.environ['FLAGS_use_mkldnn'] = '0'
-os.environ['MKLDNN_VERBOSE'] = '0'
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -12,6 +7,7 @@ from PIL import Image
 import base64
 import io
 import re
+import os
 import threading
 import traceback
 
@@ -40,7 +36,7 @@ def get_ocr():
                 from paddleocr import PaddleOCR
                 # Use optimized settings for lower memory usage
                 ocr = PaddleOCR(
-                    use_textline_orientation=False,  # Skip angle classification to save memory
+                    use_angle_cls=False,  # Skip angle classification to save memory
                     lang='en'
                 )
                 ocr_ready = True
