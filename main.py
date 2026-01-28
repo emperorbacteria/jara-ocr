@@ -32,6 +32,10 @@ if GOOGLE_API_KEY:
 else:
     print("WARNING: GOOGLE_API_KEY not set!")
 
+# Request model for JSON with base64
+class OCRRequest(BaseModel):
+    image_base64: str
+
 # Response model
 class OCRResponse(BaseModel):
     success: bool
@@ -270,16 +274,20 @@ async def health_check():
 
 
 @app.post("/ocr", response_model=OCRResponse)
-async def process_receipt(file: UploadFile = File(...)):
-    """Process receipt image using Gemini Vision"""
+async def process_receipt(request: OCRRequest):
+    """Process receipt image using Gemini Vision (accepts base64 JSON)"""
 
     if not GOOGLE_API_KEY:
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
 
     try:
-        # Read image
-        image_bytes = await file.read()
-        print(f"Processing image: {file.filename}, size: {len(image_bytes)} bytes")
+        # Decode base64 image
+        image_base64 = request.image_base64
+        # Remove data URL prefix if present
+        if ',' in image_base64:
+            image_base64 = image_base64.split(',', 1)[1]
+        image_bytes = base64.b64decode(image_base64)
+        print(f"Processing base64 image, size: {len(image_bytes)} bytes")
 
         # Analyze with Gemini
         result = await analyze_with_gemini(image_bytes)
@@ -393,6 +401,69 @@ async def process_receipt(file: UploadFile = File(...)):
             receipt_date_iso=None,
             provider=None,
             error=str(e)
+        )
+
+
+@app.post("/ocr-upload", response_model=OCRResponse)
+async def process_receipt_upload(file: UploadFile = File(...)):
+    """Process receipt image via file upload (alternative endpoint)"""
+
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY not configured")
+
+    try:
+        image_bytes = await file.read()
+        print(f"Processing uploaded file: {file.filename}, size: {len(image_bytes)} bytes")
+
+        # Analyze with Gemini
+        result = await analyze_with_gemini(image_bytes)
+
+        if "error" in result:
+            return OCRResponse(
+                success=False, text="", amount=0, currency="UNKNOWN", amount_usd=0,
+                bill_type="unknown", bill_category="unknown", transaction_id=None,
+                date=None, time=None, utility_score=0, confidence=0, is_valid_bill=False,
+                rejection_reason=f"Analysis failed: {result['error']}",
+                receipt_date_iso=None, provider=None, error=result['error']
+            )
+
+        # Process same as /ocr endpoint
+        transaction_type = result.get('transaction_type', 'unknown')
+        bill_type = result.get('bill_type', 'unknown')
+        amount = float(result.get('amount', 0))
+        currency = result.get('currency', 'NGN')
+        provider = result.get('provider')
+        transaction_id = result.get('transaction_id')
+        date = result.get('date')
+        time = result.get('time')
+        confidence = float(result.get('confidence', 0))
+        raw_text = result.get('raw_text', '')
+
+        bill_category = 'utility' if transaction_type == 'utility' else \
+                       'transfer' if transaction_type == 'transfer' else \
+                       'deposit' if transaction_type == 'deposit' else 'needs_review'
+
+        amount_usd = convert_to_usd(amount, currency)
+        utility_score = min(10, int(confidence * 10) + 2) if bill_category == 'utility' else 0
+        receipt_date_iso = parse_receipt_date(date, time)
+        is_valid_bill, rejection_reason = validate_bill(bill_type, bill_category, amount, receipt_date_iso, currency, amount_usd)
+
+        return OCRResponse(
+            success=True, text=raw_text, amount=amount, currency=currency,
+            amount_usd=round(amount_usd, 4), bill_type=bill_type, bill_category=bill_category,
+            transaction_id=transaction_id, date=date, time=time, utility_score=utility_score,
+            confidence=confidence, is_valid_bill=is_valid_bill, rejection_reason=rejection_reason,
+            receipt_date_iso=receipt_date_iso, provider=provider
+        )
+
+    except Exception as e:
+        print(f"Error processing upload: {e}")
+        return OCRResponse(
+            success=False, text="", amount=0, currency="UNKNOWN", amount_usd=0,
+            bill_type="unknown", bill_category="unknown", transaction_id=None,
+            date=None, time=None, utility_score=0, confidence=0, is_valid_bill=False,
+            rejection_reason=f"Processing error: {str(e)}",
+            receipt_date_iso=None, provider=None, error=str(e)
         )
 
 
