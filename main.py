@@ -9,8 +9,9 @@ import io
 import re
 import os
 import threading
+import traceback
 
-app = FastAPI(title="Jara OCR Service", version="1.0.0")
+app = FastAPI(title="Jara OCR Service", version="1.1.0")
 
 # CORS
 app.add_middleware(
@@ -35,8 +36,9 @@ def get_ocr():
                 from paddleocr import PaddleOCR
                 # Use optimized settings for lower memory usage
                 ocr = PaddleOCR(
-                    use_angle_cls=False,  # Skip angle classification to save memory
-                    lang='en'
+                    use_textline_orientation=False,  # Skip angle classification to save memory
+                    lang='en',
+                    show_log=False  # Reduce log noise
                 )
                 ocr_ready = True
                 print("PaddleOCR ready!")
@@ -51,6 +53,7 @@ def init_ocr_on_startup():
         print("OCR pre-initialized successfully")
     except Exception as e:
         print(f"OCR initialization error: {e}")
+        traceback.print_exc()
 
 # Utility keywords for bill detection
 UTILITY_KEYWORDS = {
@@ -120,26 +123,37 @@ def preprocess_image(img_bytes: bytes) -> np.ndarray:
 def extract_text(img_cv: np.ndarray) -> tuple[str, float]:
     """Extract text using PaddleOCR"""
     ocr_instance = get_ocr()
-    result = ocr_instance.ocr(img_cv)
 
-    if not result or not result[0]:
-        return "", 0.0
+    try:
+        # Use cls=False to disable angle classification (avoids issues with newer PaddleOCR)
+        result = ocr_instance.ocr(img_cv, cls=False)
+        print(f"OCR result type: {type(result)}, has content: {bool(result)}")
 
-    lines = []
-    confidences = []
+        if not result or not result[0]:
+            print("OCR returned empty result")
+            return "", 0.0
 
-    for line in result[0]:
-        if line and len(line) >= 2:
-            text = line[1][0]
-            conf = line[1][1]
-            if conf > 0.5:
-                lines.append(text)
-                confidences.append(conf)
+        lines = []
+        confidences = []
 
-    full_text = '\n'.join(lines)
-    avg_conf = sum(confidences) / len(confidences) if confidences else 0
+        for line in result[0]:
+            if line and len(line) >= 2:
+                text = line[1][0]
+                conf = line[1][1]
+                if conf > 0.5:
+                    lines.append(str(text))
+                    confidences.append(conf)
 
-    return full_text, avg_conf
+        full_text = '\n'.join(lines)
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0
+        print(f"Extracted {len(lines)} lines, avg confidence: {avg_conf:.2f}")
+
+        return full_text, avg_conf
+
+    except Exception as e:
+        print(f"OCR extraction error: {e}")
+        traceback.print_exc()
+        raise
 
 
 # Comprehensive global currency support
@@ -452,6 +466,12 @@ def health_check():
     }
 
 
+@app.get("/health")
+def health():
+    """Health check endpoint"""
+    return {"status": "ok", "ocr_ready": ocr_ready}
+
+
 @app.get("/warmup")
 def warmup():
     """Trigger OCR initialization"""
@@ -472,14 +492,20 @@ async def process_image(request: OCRRequest):
                 image_data = request.image_base64
 
             img_bytes = base64.b64decode(image_data)
+            print(f"Received image: {len(img_bytes)} bytes")
         except Exception as e:
+            print(f"Base64 decode error: {e}")
             raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
 
         # Preprocess
+        print("Preprocessing image...")
         img_cv = preprocess_image(img_bytes)
+        print(f"Preprocessed image shape: {img_cv.shape}")
 
         # Extract text
+        print("Extracting text...")
         text, confidence = extract_text(img_cv)
+        print(f"Text extraction complete: {len(text)} chars, confidence: {confidence:.2f}")
 
         if not text:
             return OCRResponse(
@@ -505,6 +531,8 @@ async def process_image(request: OCRRequest):
         bill_type = detect_bill_type(text)
         utility_score = calculate_utility_score(text)
 
+        print(f"Extracted: amount={amount} {currency}, type={bill_type}, txn={transaction_id}")
+
         return OCRResponse(
             success=True,
             text=text,
@@ -523,6 +551,8 @@ async def process_image(request: OCRRequest):
     except HTTPException:
         raise
     except Exception as e:
+        print(f"OCR processing error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
